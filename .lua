@@ -1390,33 +1390,43 @@ end
 TabWorld:CreateSection("Auto Rescue")
 
 local autoRescueEnabled = false
-local RESCUE_KILLER_SAFE_DIST = 60  -- Jarak yang aman dari killer
+local RESCUE_KILLER_SAFE_DIST = 60  -- Jarak aman dari killer
 local rescueDebounce = false
 
-local function findPlayerOnHook()
+-- Fungsi yang lebih sederhana untuk deteksi hook
+local function findHookedPlayer()
     for _, player in ipairs(Players:GetPlayers()) do
         if player ~= LP and player.Team == LP.Team then
             local char = player.Character
-            if char and alive(char) then
-                -- Cara deteksi pemain yang terhook bisa berbeda tergantung game
-                -- Metode 1: Cek atribut
-                local isHooked = char:GetAttribute("Hooked") or char:GetAttribute("IsHooked")
-                
-                -- Metode 2: Cek model hook/posisi
-                local hookModel = char:FindFirstChild("Hook")
-                local hookPart = hookModel and firstBasePart(hookModel)
-                
-                -- Metode 3: Cek animasi (opsional)
-                local humanoid = char:FindFirstChildOfClass("Humanoid")
-                local animator = humanoid and humanoid:FindFirstChildOfClass("Animator")
-                local hookAnim = animator and animator:GetPlayingAnimationTrack("HookAnim")
-                
-                if isHooked or hookPart or hookAnim then
-                    -- Temukan posisi untuk rescue
-                    local hrp = char:FindFirstChild("HumanoidRootPart")
-                    if hrp then
-                        return player, hrp
+            if not char or not alive(char) then continue end
+            
+            -- Metode deteksi:
+            -- 1. Cari model khusus hook
+            local hookPart = char:FindFirstChild("Hook") or char:FindFirstChild("Hooked")
+            
+            -- 2. Cek atribut khusus
+            local isHooked = char:GetAttribute("Hooked") or char:GetAttribute("IsHooked")
+            
+            -- 3. Cek humanoid state
+            local humanoid = char:FindFirstChildOfClass("Humanoid")
+            local isStunned = humanoid and humanoid.PlatformStand
+            
+            -- 4. Cek animasi bermain
+            local hasHookAnim = false
+            if humanoid and humanoid:FindFirstChildOfClass("Animator") then
+                for _, track in pairs(humanoid:FindFirstChildOfClass("Animator"):GetPlayingAnimationTracks()) do
+                    if track.Name:lower():find("hook") or track.Animation.AnimationId:find("hook") then
+                        hasHookAnim = true
+                        break
                     end
+                end
+            end
+            
+            -- Jika ada indikasi terhook
+            if hookPart or isHooked or (isStunned and hasHookAnim) then
+                local hrp = char:FindFirstChild("HumanoidRootPart")
+                if hrp then
+                    return player, hrp
                 end
             end
         end
@@ -1424,61 +1434,90 @@ local function findPlayerOnHook()
     return nil, nil
 end
 
--- Fungsi untuk mencari dan trigger rescue event
+-- Fungsi untuk coba melepaskan pemain dari hook
 local function tryRescuePlayer()
     if rescueDebounce then return end
     
-    local player, hookPos = findPlayerOnHook()
-    if not player or not hookPos then return end
+    local player, playerHRP = findHookedPlayer()
+    if not player or not playerHRP then return end
     
-    -- Cek jarak killer dari posisi hook
-    local killerDist = nearestKillerDistanceTo(hookPos.Position)
+    -- Cek jarak killer dari pemain yang terhook
+    local killerDistance = nearestKillerDistanceTo(playerHRP.Position)
+    if killerDistance <= RESCUE_KILLER_SAFE_DIST then
+        return -- Killer terlalu dekat, tidak aman
+    end
     
-    if killerDist > RESCUE_KILLER_SAFE_DIST then
-        rescueDebounce = true
-        
-        -- Teleport ke lokasi rescue
-        local rescuePos = hookPos.Position + Vector3.new(0, 0, 2)
-        tpCFrame(CFrame.new(rescuePos, hookPos.Position))
-        
-        -- Cari dan trigger rescue event
-        local rescueEvent = nil
-        
-        -- Coba temukan event rescue di ReplicatedStorage
-        local remotes = ReplicatedStorage:FindFirstChild("Remotes")
-        if remotes then
-            rescueEvent = remotes:FindFirstChild("RescueEvent") or 
-                         remotes:FindFirstChild("HookRescue") or 
-                         remotes:FindFirstChild("UnhookPlayer")
+    rescueDebounce = true
+    
+    -- Coba berbagai metode untuk melepaskan pemain
+    
+    -- 1. Teleport ke dekat pemain
+    local rescuePosition = playerHRP.Position + Vector3.new(0, 0, 3)
+    local oldHRP = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
+    local oldPos = oldHRP and oldHRP.CFrame
+    
+    tpCFrame(CFrame.new(rescuePosition))
+    
+    -- 2. Cari dan panggil event rescue
+    local rescueEvent
+    local remotes = ReplicatedStorage:FindFirstChild("Remotes")
+    if remotes then
+        -- Cari di folder yang mungkin berisi event rescue
+        local hookFolder = remotes:FindFirstChild("Hook")
+        if hookFolder then
+            rescueEvent = hookFolder:FindFirstChild("Rescue") or 
+                          hookFolder:FindFirstChild("UnhookPlayer") or
+                          hookFolder:FindFirstChild("RescueEvent")
         end
         
-        -- Jika event ditemukan, fire server
-        if rescueEvent and rescueEvent:IsA("RemoteEvent") then
-            pcall(function() 
-                rescueEvent:FireServer(player)
-                Rayfield:Notify({
-                    Title = "Auto Rescue",
-                    Content = "Rescuing " .. player.Name,
-                    Duration = 2
-                })
-            end)
-        else
-            -- Fallback: Coba interaksi langsung dengan proximity prompt
-            local proximityPrompt = hookPos:FindFirstChildOfClass("ProximityPrompt")
-            if proximityPrompt then
-                pcall(function() proximityPrompt:InputHoldBegin() end)
-                task.delay(proximityPrompt.HoldDuration + 0.1, function()
-                    pcall(function() proximityPrompt:InputHoldEnd() end)
+        -- Cari di folder remotes utama
+        if not rescueEvent then
+            rescueEvent = remotes:FindFirstChild("RescuePlayer") or
+                          remotes:FindFirstChild("Rescue") or
+                          remotes:FindFirstChild("UnhookPlayer")
+        end
+    end
+    
+    if rescueEvent and rescueEvent:IsA("RemoteEvent") then
+        -- Coba beberapa cara memanggil event rescue
+        pcall(function() rescueEvent:FireServer(player) end)
+        pcall(function() rescueEvent:FireServer(player.Character) end)
+        pcall(function() rescueEvent:FireServer() end) -- Beberapa game cukup dengan ini
+        
+        Rayfield:Notify({
+            Title = "Auto Rescue",
+            Content = "Attempting to rescue " .. player.Name,
+            Duration = 2
+        })
+    else
+        -- 3. Fallback: Coba interaksi proximity prompt
+        local success = false
+        for _, obj in ipairs(playerHRP.Parent:GetDescendants()) do
+            if obj:IsA("ProximityPrompt") then
+                pcall(function() 
+                    fireproximityprompt(obj) 
+                    success = true
                 end)
+                if success then break end
             end
         end
         
-        task.delay(3, function() rescueDebounce = false end)
+        if not success then
+            -- Kembali ke posisi semula jika gagal
+            if oldPos then
+                task.delay(1, function()
+                    tpCFrame(oldPos)
+                end)
+            end
+        end
     end
+    
+    -- Reset debounce setelah beberapa saat
+    task.delay(3, function() rescueDebounce = false end)
 end
 
--- Loop auto rescue
-local rescueLoop = nil
+-- Loop untuk Auto Rescue
+local autoRescueLoop = nil
 TabWorld:CreateToggle({
     Name = "Auto Rescue Teammates",
     CurrentValue = false,
@@ -1487,14 +1526,23 @@ TabWorld:CreateToggle({
         autoRescueEnabled = state
         
         if state then
-            if rescueLoop then rescueLoop:Disconnect() end
-            rescueLoop = RunService.Heartbeat:Connect(function()
+            if autoRescueLoop then autoRescueLoop:Disconnect() end
+            autoRescueLoop = RunService.Heartbeat:Connect(function()
                 if autoRescueEnabled and not rescueDebounce then
                     tryRescuePlayer()
                 end
             end)
+            
+            Rayfield:Notify({
+                Title = "Auto Rescue",
+                Content = "Enabled - Will rescue teammates when safe",
+                Duration = 3
+            })
         else
-            if rescueLoop then rescueLoop:Disconnect() rescueLoop = nil end
+            if autoRescueLoop then 
+                autoRescueLoop:Disconnect() 
+                autoRescueLoop = nil 
+            end
         end
     end
 })
@@ -1506,17 +1554,35 @@ local palletAssistEnabled = false
 local STUN_OPTIMAL_DISTANCE = 5  -- Jarak optimal untuk stun killer
 local stunDebounce = false
 
+-- Dapatkan semua pallet
+local function scanAllPallets()
+    local pallets = {}
+    
+    for _, model in pairs(Workspace:GetDescendants()) do
+        if model:IsA("Model") and (model.Name == "Palletwrong" or model.Name == "Pallet") then
+            local part = pickRep(model, "Palletwrong") or firstBasePart(model)
+            if part then
+                table.insert(pallets, {model = model, part = part})
+            end
+        end
+    end
+    
+    return pallets
+end
+
 -- Fungsi untuk mencari pallet terdekat
 local function findNearestPallet()
     local hrp = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
-    if not hrp then return nil end
+    if not hrp then return nil, 1e9 end
     
+    local allPallets = scanAllPallets()
     local closestPallet, closestDistance = nil, 15
-    for model, entry in pairs(worldReg.Palletwrong) do
-        if entry and entry.part and palletState[model] ~= "DOWN" and palletState[model] ~= "DEST" then
-            local distance = (entry.part.Position - hrp.Position).Magnitude
+    
+    for _, pallet in ipairs(allPallets) do
+        if pallet and pallet.part and palletState[pallet.model] ~= "DOWN" and palletState[pallet.model] ~= "DEST" then
+            local distance = (pallet.part.Position - hrp.Position).Magnitude
             if distance < closestDistance then
-                closestPallet = model
+                closestPallet = pallet
                 closestDistance = distance
             end
         end
@@ -1525,70 +1591,70 @@ local function findNearestPallet()
     return closestPallet, closestDistance
 end
 
--- Fungsi untuk mengecek killer terdekat dengan pallet
+-- Cek apakah killer cukup dekat dengan pallet untuk stun
 local function isKillerNearPallet(palletPart)
-    if not palletPart then return false end
+    if not palletPart then return false, 1e9 end
     
-    local killerDist = 1e9
     for _, player in ipairs(Players:GetPlayers()) do
         if player ~= LP and getRole(player) == "Killer" then
             local killerChar = player.Character
             local killerHRP = killerChar and killerChar:FindFirstChild("HumanoidRootPart")
             if killerHRP then
-                local dist = (killerHRP.Position - palletPart.Position).Magnitude
-                killerDist = math.min(killerDist, dist)
-                
-                if dist <= STUN_OPTIMAL_DISTANCE then
-                    return true, killerDist
+                local distance = (killerHRP.Position - palletPart.Position).Magnitude
+                if distance <= STUN_OPTIMAL_DISTANCE then
+                    return true, distance
                 end
+                return false, distance  -- Return jarak terdekat
             end
         end
     end
     
-    return false, killerDist
+    return false, 1e9
 end
 
 -- Fungsi untuk men-drop pallet
 local function tryDropPallet()
     if stunDebounce then return end
     
-    local palletModel, playerDistance = findNearestPallet()
-    if not palletModel or playerDistance > 10 then return end
+    local palletInfo, playerDistance = findNearestPallet()
+    if not palletInfo or playerDistance > 10 then return end
     
-    local palletPart = worldReg.Palletwrong[palletModel] and worldReg.Palletwrong[palletModel].part
+    local palletPart = palletInfo.part
     if not palletPart then return end
     
-    local killerNear, _ = isKillerNearPallet(palletPart)
+    local killerNear, killerDistance = isKillerNearPallet(palletPart)
     
     if killerNear and playerDistance < 10 then
         stunDebounce = true
         
-        -- Cari dan trigger drop pallet event
+        -- Cari event untuk menjatuhkan pallet
         local dropEvent = nil
         local remotes = ReplicatedStorage:FindFirstChild("Remotes")
         if remotes then
             local palletFolder = remotes:FindFirstChild("Pallet")
             if palletFolder then
-                dropEvent = palletFolder:FindFirstChild("PalletDropEvent")
+                dropEvent = palletFolder:FindFirstChild("PalletDropEvent") or 
+                            palletFolder:FindFirstChild("Drop")
             end
         end
         
         if dropEvent then
-            pcall(function() 
-                dropEvent:FireServer(palletModel) 
-                Rayfield:Notify({
-                    Title = "Pallet Stun",
-                    Content = "Stunned killer!",
-                    Duration = 2
-                })
-            end)
+            -- Coba beberapa cara memanggil event drop pallet
+            pcall(function() dropEvent:FireServer(palletInfo.model) end)
+            pcall(function() dropEvent:FireServer() end)
+            
+            Rayfield:Notify({
+                Title = "Pallet Stun",
+                Content = "Attempted to stun killer!",
+                Duration = 2
+            })
         end
         
         task.delay(2, function() stunDebounce = false end)
     end
 end
 
--- Loop untuk pallet assist
+-- Loop untuk Pallet Stun Assist
 local palletAssistLoop = nil
 TabPlayer:CreateToggle({
     Name = "Pallet Stun Assist",
@@ -1604,8 +1670,17 @@ TabPlayer:CreateToggle({
                     tryDropPallet()
                 end
             end)
+            
+            Rayfield:Notify({
+                Title = "Pallet Stun Assist",
+                Content = "Enabled - Will drop pallets automatically",
+                Duration = 3
+            })
         else
-            if palletAssistLoop then palletAssistLoop:Disconnect() palletAssistLoop = nil end
+            if palletAssistLoop then 
+                palletAssistLoop:Disconnect() 
+                palletAssistLoop = nil 
+            end
         end
     end
 })
@@ -1614,40 +1689,64 @@ TabPlayer:CreateToggle({
 TabPlayer:CreateSection("Killer Utilities")
 
 local antiStunEnabled = false
+local antiStunHooked = false
 
 -- Fungsi untuk mencegah stun pada killer
-local function installAntiStun()
-    -- Cari remote event stun
+local function setupAntiStun()
+    if antiStunHooked then return end
+    
+    -- Cara 1: Hook remote event stun
     local remotes = ReplicatedStorage:FindFirstChild("Remotes")
-    if not remotes then return end
-    
-    local mechanicsFolder = remotes:FindFirstChild("Mechanics")
-    if not mechanicsFolder then return end
-    
-    local stunRemote = mechanicsFolder:FindFirstChild("PalletStun")
-    if not stunRemote then return end
-    
-    -- Hook original connection jika ada
-    local oldConnection = remoteHooks[stunRemote]
-    if oldConnection then oldConnection:Disconnect() end
-    
-    -- Override dengan handler khusus
-    remoteHooks[stunRemote] = stunRemote.OnClientEvent:Connect(function(...)
-        if antiStunEnabled and isKillerTeam() then
-            -- Mencegah stun dengan tidak melakukan apa-apa
-            return
-        else
-            -- Proses stun normal
-            speedStunUntil = math.max(speedStunUntil, now() + 3.5)
+    if remotes then
+        local mechanicsFolder = remotes:FindFirstChild("Mechanics")
+        if mechanicsFolder then
+            local stunRemote = mechanicsFolder:FindFirstChild("PalletStun")
+            if stunRemote then
+                -- Hook original connection jika ada
+                local oldConnection = remoteHooks[stunRemote]
+                if oldConnection then oldConnection:Disconnect() end
+                
+                -- Override dengan handler khusus
+                remoteHooks[stunRemote] = stunRemote.OnClientEvent:Connect(function(...)
+                    if antiStunEnabled and isKillerTeam() then
+                        -- Mencegah stun dengan tidak melakukan apa-apa
+                        return
+                    else
+                        -- Proses stun normal
+                        speedStunUntil = math.max(speedStunUntil, now() + 3.5)
+                    end
+                end)
+                
+                antiStunHooked = true
+                return true
+            end
         end
-    end)
+    end
     
-    Rayfield:Notify({
-        Title = "Anti Stun",
-        Content = isKillerTeam() and "Activated for Killer" or "Will activate when you become Killer",
-        Duration = 4
-    })
-end
+    -- Cara 2: Hook dengan metafunction (fallback)
+    if typeof(hookmetamethod) == "function" and typeof(getnamecallmethod) == "function" then
+        local oldNc
+        oldNc = hookmetamethod(game, "__namecall", function(self, ...)
+            local method = getnamecallmethod()
+            local args = {...}
+            
+            -- Cek apakah ini adalah remote stun
+            if antiStunEnabled and isKillerTeam() and 
+               typeof(self) == "Instance" and 
+               (self.Name:lower():find("stun") or self.Name:lower():find("pallet")) and
+               (method == "FireServer" or method == "InvokeServer") then
+                   return nil  -- Block call
+            end
+            
+            return oldNc(self, ...)
+        end)
+        
+        antiStunHooked = true
+        return true
+    end
+    
+    return false
+}
 
 TabPlayer:CreateToggle({
     Name = "Anti Stun (Killer Only)",
@@ -1657,22 +1756,15 @@ TabPlayer:CreateToggle({
         antiStunEnabled = state
         
         if state then
-            installAntiStun()
-        else
-            -- Restore normal behavior
-            local remotes = ReplicatedStorage:FindFirstChild("Remotes")
-            if remotes then
-                local mechanicsFolder = remotes:FindFirstChild("Mechanics")
-                if mechanicsFolder then
-                    local stunRemote = mechanicsFolder:FindFirstChild("PalletStun")
-                    if stunRemote and remoteHooks[stunRemote] then
-                        remoteHooks[stunRemote]:Disconnect()
-                        remoteHooks[stunRemote] = stunRemote.OnClientEvent:Connect(function()
-                            speedStunUntil = math.max(speedStunUntil, now() + 3.5)
-                        end)
-                    end
-                end
-            end
+            local success = setupAntiStun()
+            
+            Rayfield:Notify({
+                Title = "Anti Stun",
+                Content = success 
+                    and (isKillerTeam() and "Activated for Killer" or "Will activate when you become Killer")
+                    or "Failed to setup Anti Stun",
+                Duration = 4
+            })
         end
     end
 })
@@ -1680,109 +1772,157 @@ TabPlayer:CreateToggle({
 -- Add team change check untuk anti-stun
 LP:GetPropertyChangedSignal("Team"):Connect(function()
     if antiStunEnabled and not isKillerTeam() then
-        -- Nonaktifkan jika player bukan killer
-        antiStunEnabled = false
-        Rayfield:SetValue("AntiStun", false)
+        -- Notify but don't disable - it'll activate when becoming killer
+        Rayfield:Notify({
+            Title = "Anti Stun",
+            Content = "Will activate when you become Killer",
+            Duration = 3
+        })
     elseif antiStunEnabled and isKillerTeam() then
-        -- Reinstall jika player menjadi killer
-        installAntiStun()
+        setupAntiStun()
+        Rayfield:Notify({
+            Title = "Anti Stun",
+            Content = "Now active for Killer",
+            Duration = 3
+        })
     end
 end)
 
 -- ========= FITUR BARU: PING SERVER =========
 TabMisc:CreateSection("Connection Info")
 
--- Setup GUI untuk ping
-local pingDisplayEnabled = false
-local pingFrame = nil
-local pingLabel = nil
-local pingUpdateInterval = 2 -- Seconds
-local lastPingCheck = 0
+-- Setup GUI yang lebih stabil untuk ping
+local pingEnabled = false
+local pingGui = nil
+local pingText = nil
+local lastPingUpdate = 0
+local pingUpdateFrequency = 1
 
--- Buat ping display
+-- Buat ScreenGui yang lebih persistent
 local function setupPingDisplay()
-    if pingFrame then return end
-
-    local screenGui = LP:FindFirstChild("PlayerGui"):FindFirstChild("ViolenceDistrictGUI")
-    if not screenGui then
-        screenGui = Instance.new("ScreenGui")
-        screenGui.Name = "ViolenceDistrictGUI"
-        screenGui.Parent = LP:FindFirstChild("PlayerGui")
+    -- Hapus yang lama jika ada
+    local existingGui = game:GetService("CoreGui"):FindFirstChild("VD_PingMonitor")
+    if existingGui then 
+        existingGui:Destroy() 
     end
-
-    pingFrame = Instance.new("Frame")
-    pingFrame.Name = "PingFrame"
-    pingFrame.Size = UDim2.new(0, 100, 0, 30)
-    pingFrame.Position = UDim2.new(0, 10, 0, 10)
-    pingFrame.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
-    pingFrame.BackgroundTransparency = 0.5
-    pingFrame.BorderSizePixel = 0
-    pingFrame.Visible = false
-    pingFrame.Parent = screenGui
-
-    pingLabel = Instance.new("TextLabel")
-    pingLabel.Name = "PingLabel"
-    pingLabel.Size = UDim2.new(1, 0, 1, 0)
-    pingLabel.BackgroundTransparency = 1
-    pingLabel.Text = "Ping: --ms"
-    pingLabel.Font = Enum.Font.GothamBold
-    pingLabel.TextSize = 14
-    pingLabel.TextColor3 = Color3.new(1, 1, 1)
-    pingLabel.Parent = pingFrame
-end
-
--- Fungsi untuk mengukur ping
-local function getPing()
-    local ping = game:GetService("Stats").Network.ServerStatsItem["Data Ping"]:GetValue()
-    return math.floor(ping)
-end
-
--- Update warna label berdasarkan ping
-local function updatePingColor(ping)
-    if not pingLabel then return end
     
+    -- Buat yang baru di CoreGui (lebih stabil)
+    pingGui = Instance.new("ScreenGui")
+    pingGui.Name = "VD_PingMonitor"
+    pingGui.ResetOnSpawn = false
+    pingGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    pingGui.DisplayOrder = 999
+    pingGui.IgnoreGuiInset = true
+    
+    -- Coba pasang di tempat yang lebih stabil
+    pcall(function()
+        if syn and syn.protect_gui then
+            syn.protect_gui(pingGui)
+            pingGui.Parent = game:GetService("CoreGui")
+        elseif gethui then
+            pingGui.Parent = gethui()
+        else
+            pingGui.Parent = game:GetService("CoreGui")
+        end
+    end)
+    
+    -- Kalau gagal, fallback ke PlayerGui
+    if not pingGui.Parent then
+        pingGui.Parent = LP:FindFirstChild("PlayerGui")
+    end
+    
+    -- Buat frame dan text
+    local frame = Instance.new("Frame")
+    frame.Name = "PingFrame"
+    frame.Size = UDim2.new(0, 120, 0, 30)
+    frame.Position = UDim2.new(0, 10, 0, 10)
+    frame.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+    frame.BackgroundTransparency = 0.5
+    frame.BorderSizePixel = 0
+    frame.Parent = pingGui
+    
+    pingText = Instance.new("TextLabel")
+    pingText.Name = "PingLabel"
+    pingText.Size = UDim2.new(1, 0, 1, 0)
+    pingText.BackgroundTransparency = 1
+    pingText.Text = "Ping: --ms"
+    pingText.Font = Enum.Font.GothamBold
+    pingText.TextSize = 14
+    pingText.TextColor3 = Color3.new(1, 1, 1)
+    pingText.Parent = frame
+    
+    -- Tambahkan agar tetap terlihat
+    pingGui.DescendantRemoving:Connect(function(descendant)
+        if descendant == frame or descendant == pingText then
+            task.delay(0.1, setupPingDisplay)
+        end
+    end)
+    
+    return true
+end
+
+-- Fungsi untuk mendapatkan ping yang lebih akurat
+local function getCurrentPing()
+    local stats = game:GetService("Stats")
+    local ping = math.floor(stats.Network.ServerStatsItem["Data Ping"]:GetValue())
+    return ping
+}
+
+-- Fungsi untuk update tampilan ping
+local function updatePingDisplay()
+    if not pingText then return end
+    
+    local ping = getCurrentPing()
+    
+    -- Set warna berdasarkan ping
     if ping < 100 then
-        pingLabel.TextColor3 = Color3.fromRGB(0, 255, 0) -- Green (good)
+        pingText.TextColor3 = Color3.fromRGB(0, 255, 0) -- Green (good)
     elseif ping < 200 then
-        pingLabel.TextColor3 = Color3.fromRGB(255, 255, 0) -- Yellow (ok)
+        pingText.TextColor3 = Color3.fromRGB(255, 255, 0) -- Yellow (ok)
     else
-        pingLabel.TextColor3 = Color3.fromRGB(255, 0, 0) -- Red (bad)
+        pingText.TextColor3 = Color3.fromRGB(255, 0, 0) -- Red (bad)
     end
     
-    pingLabel.Text = "Ping: " .. tostring(ping) .. "ms"
-end
+    pingText.Text = "Ping: " .. tostring(ping) .. "ms"
+}
 
+-- Loop untuk update ping
 local pingUpdateLoop = nil
 TabMisc:CreateToggle({
     Name = "Show Server Ping",
     CurrentValue = false,
     Flag = "ShowPing",
     Callback = function(state)
-        pingDisplayEnabled = state
+        pingEnabled = state
         
         if state then
             setupPingDisplay()
-            if pingFrame then pingFrame.Visible = true end
             
-            if pingUpdateLoop then pingUpdateLoop:Disconnect() end
+            if pingGui then
+                pingGui.Enabled = true
+            end
+            
+            if pingUpdateLoop then
+                pingUpdateLoop:Disconnect()
+                pingUpdateLoop = nil
+            end
+            
             pingUpdateLoop = RunService.Heartbeat:Connect(function()
-                if not pingDisplayEnabled then return end
+                if not pingEnabled then return end
                 
                 local currentTime = now()
-                if currentTime - lastPingCheck >= pingUpdateInterval then
-                    lastPingCheck = currentTime
-                    local currentPing = getPing()
-                    updatePingColor(currentPing)
+                if currentTime - lastPingUpdate >= pingUpdateFrequency then
+                    lastPingUpdate = currentTime
+                    
+                    -- Pastikan GUI masih ada
+                    if not pingGui or not pingGui.Parent then
+                        setupPingDisplay()
+                    end
+                    
+                    updatePingDisplay()
                 end
             end)
-        else
-            if pingFrame then pingFrame.Visible = false end
-            if pingUpdateLoop then pingUpdateLoop:Disconnect() pingUpdateLoop = nil end
-        end
-    end
-})
-
--- ========= finalize =========
-Rayfield:LoadConfiguration()
-Rayfield:Notify({Title="Violence District",Content="Loaded",Duration=6})
-Rayfield:Notify({Title="Info",Content="Added 4 new features by Qerix",Duration=6})
+            
+            Rayfield:Notify({
+                Title = "Ping Display",
+                Content = "Enabled - Showing 
